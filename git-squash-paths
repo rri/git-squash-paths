@@ -1,0 +1,131 @@
+#!/bin/sh
+
+set -euo pipefail
+
+IFS=$'\n\t'
+
+COL_RED='\033[1;31m'
+COL_YEL='\033[0;35m'
+COL_RST='\033[0m'
+
+print_usage() {
+    echo -e "${COL_RED}USAGE:${COL_RST} git-squash-paths TARGET-COMMIT PATH-1 [...]"
+    echo -e "...where:"
+    echo -e "  - TARGET-COMMIT is the SHA1 of the commit to squash _into_"
+    echo -e "  - PATH-1 [...] are one or more paths to squash"
+}
+
+[ "$#" -lt 2 ] && print_usage && exit 99
+
+# Make sure the referenced commit exists and get its SHORT SHA1 reference.
+if TARGET_COMMIT=$(git rev-parse --short $(git --no-pager log --decorate=short --pretty=oneline -n1 "$1" 2>/dev/null | awk '{ print $1 }')); then
+    # Move on to paths.
+    shift
+
+    PATHS=()
+
+    # Make sure the referenced paths exist and add them to an array.
+    while [ "$#" -gt 0 ]; do
+        [ -f "$1" ] || (
+            echo
+            echo -e "${COL_RED}ERROR:${COL_RST} Invalid path: ${COL_YEL}$1${COL_RST}"
+            echo
+            print_usage
+            exit 1
+        )
+        PATHS+=("$1")
+        shift
+    done
+
+    # Check if the target commit is the first commit, because "no parent" requires special treatment.
+    if git-rev-parse --verify "${TARGET_COMMIT}^" >/dev/null 2>&1; then
+        BASE="${TARGET_COMMIT}^" # Base = Parent
+    else
+        BASE="--root"     # Base = Root
+    fi
+
+    EDIT_EXPR=""
+
+    # Identify all commits that touch the paths we're interested in, and build a sed expression to control rebase.
+    for ITEM in $(git --no-pager log --oneline "${TARGET_COMMIT}".. --oneline -- "${PATHS[@]}" | awk '{ print $1 }'); do
+        EDIT_EXPR+="s/^pick ${ITEM}/edit ${ITEM}/;" # Mark for EDIT
+    done
+
+    # Rebase starting from the base commit and stop at each identified commit.
+    GIT_SEQUENCE_EDITOR="sed -i '${EDIT_EXPR}'" git rebase -q -i ${BASE}
+
+    SPLIT_COMMITS=()
+
+    # On each identified commit, split out updates to paths of interest as separate commits.
+    #
+    # COMMIT-1 = COMMIT-2 + COMMIT-3
+    # ...where:
+    #   - COMMIT-2 = COMMIT-1 + UNDO-COMMIT
+    #   - COMMIT-3 = REDO-COMMIT
+    # ...and:
+    #   - UNDO-COMMIT undoes changes to paths of interest within COMMIT-1
+    #   - REDO-COMMIT undoes UNDO-COMMIT
+    #
+    # The general strategy is as follows:
+    # - Stop at the identified commit.
+    # - REVERT the files we're interested in to parent state, to create an UNDO commit.
+    # - REVERT the UNDO commit to create a REDO patch, but don't commit it just yet, STASH it instead.
+    # - Perform a SOFT RESET of the UNDO commit and amend the parent commit to merge them together (if non-empty).
+    # - Pop the stash and now create the REDO commit.
+    # - Record the SHORT SHA1 of the REDO commit.
+    # - Continue rebasing.
+    while [ -d .git/rebase-merge ]; do
+        # Track the subset of paths we're interested in for this identified commit
+        CURR=()
+        for P in "${PATHS[@]}"; do
+            # Check that the path is modified in any way in the current commit, otherwise continue
+            if git ls-tree -r HEAD -- "${P}" | grep -q .; then
+                CURR+=("${P}")
+                if git ls-tree -r HEAD~ -- "${P}" | grep -q .; then
+                    # The path we're interested in has been UPDATED in this commit.
+                    git checkout HEAD~ -- "${P}"
+                else
+                    # The path we're interested in has been CREATED in this commit.
+                    git rm -f -- "${P}"
+                fi
+            fi
+        done
+        git commit --no-edit -m "TEMP: Revert paths"
+        git revert --no-commit HEAD
+        git stash
+        git reset --soft HEAD~
+
+        if git diff --cached HEAD~ --quiet; then
+            git reset HEAD~              # COMMIT-1 + UNDO-COMMIT would be empty so delete it
+        else
+            git commit --amend --no-edit # Merge UNDO-COMMIT into COMMIT-1 to create COMMIT-2
+        fi
+
+        git stash pop
+        git add -- "${CURR[@]}"
+        # Create COMMIT-3, equal to REDO-COMMIT.
+        git commit -m "SPLIT: Path changes"
+
+        # Record the REDO-COMMIT for later use as we will need to re-order and merge them into the target commit.
+        SPLIT_COMMITS+=("$(git rev-parse --short HEAD)")
+
+        git rebase --continue || true
+    done
+
+    FIXUP_EXPR=""
+
+    # For each REDO-COMMIT that has been split out, move adjacent to the target commit and mark them for fixup.
+    for ITEM in "${SPLIT_COMMITS[@]}"; do
+        FIXUP_EXPR+="-e '/^pick ${ITEM}/d' "
+        FIXUP_EXPR+="-e '/^pick ${TARGET_COMMIT}/a fixup ${ITEM}' "
+    done
+
+    GIT_SEQUENCE_EDITOR="sed -i ${FIXUP_EXPR}" git rebase -q -i ${BASE}
+else
+    echo
+    echo -e "${COL_RED}ERROR:${COL_RST} Invalid commit reference: ${COL_YEL}$1${COL_RST}"
+    echo
+    print_usage
+    exit 2
+fi
+
